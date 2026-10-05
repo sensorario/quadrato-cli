@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -51,7 +52,9 @@ type tuiModel struct {
 	pickingTime    bool
 	timeSlots      []time.Time
 	timeCursor     int
+	showHelp       bool
 	editing        bool
+	creatingNew    bool
 	editField      int // 0=titolo, 1=progetto, 2=descrizione
 	editInputs     []textinput.Model
 	editTextarea   textarea.Model
@@ -122,6 +125,7 @@ type updateDone struct {
 	task      Task
 	err       error
 	isDeleted bool
+	isNew     bool
 }
 
 type moveDone struct {
@@ -217,6 +221,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "esc":
 				m.editing = false
+				m.creatingNew = false
 			case "tab":
 				m.editField = (m.editField + 1) % 3
 				m.editInputs[0].Blur()
@@ -228,6 +233,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.editTextarea.Focus()
 				}
 			case "ctrl+s":
+				if m.creatingNew {
+					return m, m.createTask()
+				}
 				return m, m.saveTask()
 			default:
 				if m.editField == 0 {
@@ -242,7 +250,15 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.String() {
+		case "h":
+			m.showHelp = !m.showHelp
+			return m, nil
+
 		case "q", "ctrl+c", "esc":
+			if m.showHelp {
+				m.showHelp = false
+				return m, nil
+			}
 			m.quitting = true
 			return m, tea.Quit
 
@@ -291,6 +307,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = 0
 			m.flash = ""
 
+		case "a":
+			var cmd tea.Cmd
+			m, cmd = m.openNewTask()
+			return m, cmd
+
 		case "o":
 			if len(m.tasks) > 0 {
 				var cmd tea.Cmd
@@ -323,6 +344,16 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.flash = "✗ " + msg.err.Error()
 			m.flashIsErr = true
+		} else if msg.isNew {
+			m.allTasks = append(m.allTasks, msg.task)
+			if m.currentTab == 0 || m.currentTab == 4 {
+				m.tasks = filterTab(m.allTasks, m.currentTab)
+				m.cursor = len(m.tasks) - 1
+			}
+			m.editing = false
+			m.creatingNew = false
+			m.flash = "✓ " + msg.task.Title
+			m.flashIsErr = false
 		} else {
 			// aggiorna in allTasks
 			if msg.isDeleted {
@@ -357,6 +388,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.editing = false
+			m.creatingNew = false
 			m.flash = "✓ " + msg.task.Title
 			m.flashIsErr = false
 		}
@@ -413,6 +445,48 @@ func (m tuiModel) openTask() (tuiModel, tea.Cmd) {
 
 	cmd := m.editInputs[0].Focus()
 	return m, cmd
+}
+
+func (m tuiModel) openNewTask() (tuiModel, tea.Cmd) {
+	ti := textinput.New()
+	ti.CharLimit = 200
+	ti.Placeholder = "Titolo"
+
+	pi := textinput.New()
+	pi.CharLimit = 100
+	pi.Placeholder = "Progetto"
+
+	ta := textarea.New()
+
+	m.creatingNew = true
+	m.editing = true
+	m.editField = 0
+	m.editInputs = []textinput.Model{ti, pi}
+	m.editTextarea = ta
+
+	cmd := m.editInputs[0].Focus()
+	return m, cmd
+}
+
+func (m tuiModel) createTask() tea.Cmd {
+	return func() tea.Msg {
+		t := Task{
+			Title:           m.editInputs[0].Value(),
+			Project:         m.editInputs[1].Value(),
+			LongDescription: m.editTextarea.Value(),
+			Status:          0,
+			Archived:        false,
+		}
+		body, err := doRequest("POST", "/task", t, m.token)
+		if err != nil {
+			return updateDone{err: err}
+		}
+		var result struct {
+			Task Task `json:"task"`
+		}
+		json.Unmarshal(body, &result)
+		return updateDone{task: result.Task, isNew: true}
+	}
 }
 
 func (m tuiModel) saveTask() tea.Cmd {
@@ -583,9 +657,48 @@ func (m tuiModel) View() string {
 
 	b.WriteString("\n")
 
+	// help
+	if m.showHelp {
+		b.WriteString(titleBar.Render("  Comandi da tastiera"))
+		b.WriteString("\n\n")
+		rows := [][2]string{
+			{"↑ / k", "Su"},
+			{"↓ / j", "Giù"},
+			{"tab", "Cambia vista"},
+			{"a", "Nuovo task"},
+			{"o", "Apri / modifica"},
+			{"enter / spazio", "Segna in corso"},
+			{"d", "Segna fatto"},
+			{"r", "Riporta a Da fare (o riapri se archiviato)"},
+			{"s", "Schedula"},
+			{"+ / =", "Aumenta priorità"},
+			{"-", "Diminuisci priorità"},
+			{"x", "Elimina"},
+			{"h", "Aiuto (questa schermata)"},
+			{"q / esc", "Esci"},
+		}
+		keyW := 18
+		for _, row := range rows {
+			key := row[0]
+			pad := keyW - len(key)
+			if pad < 1 {
+				pad = 1
+			}
+			b.WriteString(fmt.Sprintf("  %s%s%s\n", bold.Render(key), strings.Repeat(" ", pad), row[1]))
+		}
+		b.WriteString("\n")
+		b.WriteString(helpBar.Render("  h / esc  chiudi"))
+		b.WriteString("\n")
+		return b.String()
+	}
+
 	// vista edit task
-	if m.editing && len(m.tasks) > 0 {
-		b.WriteString(titleBar.Render("  Modifica task"))
+	if m.editing && (m.creatingNew || len(m.tasks) > 0) {
+		title := "  Modifica task"
+		if m.creatingNew {
+			title = "  Nuovo task"
+		}
+		b.WriteString(titleBar.Render(title))
 		b.WriteString("\n\n")
 
 		for idx, label := range []string{"Titolo", "Progetto"} {
@@ -679,9 +792,9 @@ func (m tuiModel) View() string {
 
 	// help bar
 	if m.archiveMode {
-		b.WriteString(helpBar.Render("  tab vista  ↑↓ naviga  r riapri  x elimina  q esci"))
+		b.WriteString(helpBar.Render("  tab vista  ↑↓ naviga  r riapri  x elimina  h aiuto  q esci"))
 	} else {
-		b.WriteString(helpBar.Render("  tab vista  ↑↓ naviga  o apri  enter in corso  d fatto  r riapri  s schedula  +/- priorità  x elimina  q esci"))
+		b.WriteString(helpBar.Render("  tab vista  ↑↓ naviga  a nuovo  o apri  enter in corso  d fatto  r riapri  s schedula  +/- priorità  x elimina  h aiuto  q esci"))
 	}
 	b.WriteString("\n")
 

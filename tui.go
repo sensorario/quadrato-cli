@@ -5,6 +5,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -49,6 +51,10 @@ type tuiModel struct {
 	pickingTime    bool
 	timeSlots      []time.Time
 	timeCursor     int
+	editing        bool
+	editField      int // 0=titolo, 1=progetto, 2=descrizione
+	editInputs     []textinput.Model
+	editTextarea   textarea.Model
 }
 
 func todayWorkingSlots() []time.Time {
@@ -205,6 +211,36 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// modalità edit task
+		if m.editing {
+			var cmd tea.Cmd
+			switch msg.String() {
+			case "esc":
+				m.editing = false
+			case "tab":
+				m.editField = (m.editField + 1) % 3
+				m.editInputs[0].Blur()
+				m.editInputs[1].Blur()
+				m.editTextarea.Blur()
+				if m.editField < 2 {
+					cmd = m.editInputs[m.editField].Focus()
+				} else {
+					m.editTextarea.Focus()
+				}
+			case "ctrl+s":
+				return m, m.saveTask()
+			default:
+				if m.editField == 0 {
+					m.editInputs[0], cmd = m.editInputs[0].Update(msg)
+				} else if m.editField == 1 {
+					m.editInputs[1], cmd = m.editInputs[1].Update(msg)
+				} else {
+					m.editTextarea, cmd = m.editTextarea.Update(msg)
+				}
+			}
+			return m, cmd
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
 			m.quitting = true
@@ -254,6 +290,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tasks = filterTab(m.allTasks, m.currentTab)
 			m.cursor = 0
 			m.flash = ""
+
+		case "o":
+			if len(m.tasks) > 0 {
+				var cmd tea.Cmd
+				m, cmd = m.openTask()
+				return m, cmd
+			}
 
 		case "+", "=":
 			if m.cursor > 0 {
@@ -313,8 +356,21 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cursor--
 				}
 			}
+			m.editing = false
 			m.flash = "✓ " + msg.task.Title
 			m.flashIsErr = false
+		}
+
+	default:
+		// inoltra i messaggi interni (blink, tick) ai componenti edit attivi
+		if m.editing && len(m.editInputs) == 2 {
+			var cmd tea.Cmd
+			if m.editField < 2 {
+				m.editInputs[m.editField], cmd = m.editInputs[m.editField].Update(msg)
+			} else {
+				m.editTextarea, cmd = m.editTextarea.Update(msg)
+			}
+			return m, cmd
 		}
 	}
 
@@ -331,6 +387,40 @@ func (m tuiModel) setStatus(status int) tea.Cmd {
 		if status == 3 {
 			t.Archived = true
 		}
+		_, err := doRequest("PUT", "/task/"+t.ID, t, m.token)
+		return updateDone{task: t, err: err}
+	}
+}
+
+func (m tuiModel) openTask() (tuiModel, tea.Cmd) {
+	t := m.tasks[m.cursor]
+
+	ti := textinput.New()
+	ti.SetValue(t.Title)
+	ti.CharLimit = 200
+
+	pi := textinput.New()
+	pi.SetValue(t.Project)
+	pi.CharLimit = 100
+
+	ta := textarea.New()
+	ta.SetValue(t.LongDescription)
+
+	m.editing = true
+	m.editField = 0
+	m.editInputs = []textinput.Model{ti, pi}
+	m.editTextarea = ta
+
+	cmd := m.editInputs[0].Focus()
+	return m, cmd
+}
+
+func (m tuiModel) saveTask() tea.Cmd {
+	return func() tea.Msg {
+		t := m.tasks[m.cursor]
+		t.Title = m.editInputs[0].Value()
+		t.Project = m.editInputs[1].Value()
+		t.LongDescription = m.editTextarea.Value()
 		_, err := doRequest("PUT", "/task/"+t.ID, t, m.token)
 		return updateDone{task: t, err: err}
 	}
@@ -493,6 +583,35 @@ func (m tuiModel) View() string {
 
 	b.WriteString("\n")
 
+	// vista edit task
+	if m.editing && len(m.tasks) > 0 {
+		b.WriteString(titleBar.Render("  Modifica task"))
+		b.WriteString("\n\n")
+
+		for idx, label := range []string{"Titolo", "Progetto"} {
+			indicator := "  "
+			if m.editField == idx {
+				indicator = "▶ "
+			}
+			b.WriteString(indicator + bold.Render(label+"  "))
+			b.WriteString(m.editInputs[idx].View())
+			b.WriteString("\n\n")
+		}
+
+		indicator := "  "
+		if m.editField == 2 {
+			indicator = "▶ "
+		}
+		b.WriteString(indicator + bold.Render("Descrizione"))
+		b.WriteString("\n")
+		b.WriteString(m.editTextarea.View())
+		b.WriteString("\n\n")
+
+		b.WriteString(helpBar.Render("  tab campo  ctrl+s salva  esc annulla"))
+		b.WriteString("\n")
+		return b.String()
+	}
+
 	// sottomenu time picker
 	if m.pickingTime && len(m.timeSlots) > 0 && len(m.tasks) > 0 {
 		t := m.tasks[m.cursor]
@@ -562,7 +681,7 @@ func (m tuiModel) View() string {
 	if m.archiveMode {
 		b.WriteString(helpBar.Render("  tab vista  ↑↓ naviga  r riapri  x elimina  q esci"))
 	} else {
-		b.WriteString(helpBar.Render("  tab vista  ↑↓ naviga  enter in corso  d fatto  r riapri  s schedula  +/- priorità  x elimina  q esci"))
+		b.WriteString(helpBar.Render("  tab vista  ↑↓ naviga  o apri  enter in corso  d fatto  r riapri  s schedula  +/- priorità  x elimina  q esci"))
 	}
 	b.WriteString("\n")
 

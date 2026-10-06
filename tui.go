@@ -233,7 +233,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.editTextarea.Focus()
 				}
 			case "ctrl+s":
-				if m.creatingNew {
+				creating := m.creatingNew
+				m.editing = false
+				m.creatingNew = false
+				m.editField = 0
+				if creating {
 					return m, m.createTask()
 				}
 				return m, m.saveTask()

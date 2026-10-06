@@ -40,6 +40,7 @@ type tuiModel struct {
 	currentTab     int // 0 = attivi, 1 = archiviati
 	cursor         int
 	token          string
+	workspace      string
 	showAll        bool
 	archiveMode    bool
 	flash          string
@@ -113,10 +114,18 @@ func removeByID(tasks []Task, id string) []Task {
 }
 
 func newTUI(allTasks []Task, token string) tuiModel {
+	ws := "default"
+	for _, t := range allTasks {
+		if t.Workspace != "" {
+			ws = t.Workspace
+			break
+		}
+	}
 	return tuiModel{
 		allTasks:   allTasks,
 		tasks:      filterTab(allTasks, 0),
 		token:      token,
+		workspace:  ws,
 		currentTab: 0,
 	}
 }
@@ -233,11 +242,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.editTextarea.Focus()
 				}
 			case "ctrl+s":
-				creating := m.creatingNew
-				m.editing = false
-				m.creatingNew = false
-				m.editField = 0
-				if creating {
+				if m.creatingNew {
 					return m, m.createTask()
 				}
 				return m, m.saveTask()
@@ -305,6 +310,14 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "tab":
 			m.currentTab = (m.currentTab + 1) % 5
+			m.archiveMode = m.currentTab == 1
+			m.showAll = false
+			m.tasks = filterTab(m.allTasks, m.currentTab)
+			m.cursor = 0
+			m.flash = ""
+
+		case "shift+tab":
+			m.currentTab = (m.currentTab + 4) % 5
 			m.archiveMode = m.currentTab == 1
 			m.showAll = false
 			m.tasks = filterTab(m.allTasks, m.currentTab)
@@ -480,15 +493,20 @@ func (m tuiModel) createTask() tea.Cmd {
 			LongDescription: m.editTextarea.Value(),
 			Status:          0,
 			Archived:        false,
+			Workspace:       m.workspace,
 		}
 		body, err := doRequest("POST", "/task", t, m.token)
 		if err != nil {
-			return updateDone{err: err}
+			return updateDone{err: err, isNew: true}
 		}
 		var result struct {
 			Task Task `json:"task"`
 		}
-		json.Unmarshal(body, &result)
+		if err := json.Unmarshal(body, &result); err != nil || result.Task.ID == "" {
+			var direct Task
+			json.Unmarshal(body, &direct)
+			return updateDone{task: direct, isNew: true}
+		}
 		return updateDone{task: result.Task, isNew: true}
 	}
 }
@@ -724,6 +742,13 @@ func (m tuiModel) View() string {
 		b.WriteString(m.editTextarea.View())
 		b.WriteString("\n\n")
 
+		if m.flash != "" {
+			if m.flashIsErr {
+				b.WriteString(errStyle.Render("  "+m.flash) + "\n")
+			} else {
+				b.WriteString(flashStyle.Render("  "+m.flash) + "\n")
+			}
+		}
 		b.WriteString(helpBar.Render("  tab campo  ctrl+s salva  esc annulla"))
 		b.WriteString("\n")
 		return b.String()
